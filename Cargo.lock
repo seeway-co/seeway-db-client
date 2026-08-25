@@ -2172,6 +2172,7 @@ dependencies = [
  "tokio-rustls 0.26.4",
  "url",
  "uuid",
+ "zip",
 ]
 
 [[package]]
