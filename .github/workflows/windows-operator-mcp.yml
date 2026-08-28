@@ -1,0 +1,95 @@
+name: Windows 运营交付 MCP 构建
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - bundle/windows-operator-mcp
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-x64:
+    name: 构建 Windows x64 MCP
+    runs-on: windows-2025
+    timeout-minutes: 90
+
+    steps:
+      - name: 检出固定源码
+        uses: actions/checkout@v5
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: 准备 OpenSSL 构建所需 Perl
+        shell: pwsh
+        env:
+          PERL_ARCHIVE_URL: https://github.com/shogo82148/build-perl/releases/download/perl-5.42.3-20260803012115/perl-5.42.3-thr-win32-x64.zip
+          PERL_ARCHIVE_SHA256: 4f0ac6fe1a4221c1fa1804c2d81999bdecebd505a61d0d04720e9b3925cd6db4
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP "perl-5.42.3-thr-win32-x64.zip"
+          $destination = Join-Path $env:RUNNER_TEMP "openssl-perl"
+          curl.exe --fail --location --retry 5 --retry-all-errors $env:PERL_ARCHIVE_URL --output $archive
+          if ($LASTEXITCODE -ne 0) {
+            throw "无法下载 Perl 构建环境。"
+          }
+          $actualHash = (Get-FileHash -Path $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $env:PERL_ARCHIVE_SHA256) {
+            throw "Perl 压缩包 SHA-256 不符合预期：$actualHash"
+          }
+          Expand-Archive -Path $archive -DestinationPath $destination -Force
+          $perl = Get-ChildItem -Path $destination -Filter perl.exe -Recurse |
+            Where-Object { $_.FullName -match '[\\/]bin[\\/]perl\.exe$' } |
+            Select-Object -First 1
+          if (-not $perl) {
+            throw "未找到 perl.exe。"
+          }
+          & $perl.FullName -MParams::Check -e 1
+          if ($LASTEXITCODE -ne 0) {
+            throw "Perl 无法加载 Params::Check。"
+          }
+          "OPENSSL_SRC_PERL=$($perl.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: 构建增强 DBX MCP
+        shell: pwsh
+        run: |
+          cargo build --locked --release --package dbx-mcp --no-default-features --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) {
+            throw "DBX MCP 构建失败。"
+          }
+
+      - name: 生成校验与构建清单
+        shell: pwsh
+        run: |
+          $output = "target/x86_64-pc-windows-msvc/release/dbx-mcp.exe"
+          $bundle = "windows-operator-mcp"
+          New-Item -ItemType Directory -Path $bundle -Force | Out-Null
+          Copy-Item $output "$bundle/dbx-mcp.exe"
+          $sourceCommit = (git rev-parse HEAD).Trim()
+          $binaryHash = (Get-FileHash -Path "$bundle/dbx-mcp.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+          $lockHash = (Get-FileHash -Path "Cargo.lock" -Algorithm SHA256).Hash.ToLowerInvariant()
+          $rustVersion = (rustc --version).Trim()
+          $manifest = [ordered]@{
+            formatVersion = 1
+            sourceRepository = "https://github.com/xingranya/dbx"
+            sourceCommit = $sourceCommit
+            target = "x86_64-pc-windows-msvc"
+            cargoFeatures = "--no-default-features"
+            cargoLockSha256 = $lockHash
+            rustVersion = $rustVersion
+            binary = "dbx-mcp.exe"
+            binarySha256 = $binaryHash
+          }
+          $manifest | ConvertTo-Json -Depth 4 | Set-Content -Path "$bundle/BUILD-MANIFEST.json" -Encoding utf8
+          "$binaryHash  dbx-mcp.exe" | Set-Content -Path "$bundle/SHA256SUMS" -Encoding ascii
+
+      - name: 上传 Windows MCP 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbx-mcp-windows-x64-5747853
+          path: windows-operator-mcp/*
+          if-no-files-found: error
+          retention-days: 30
